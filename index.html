@@ -1,257 +1,134 @@
-// Firebase configuration
-const firebaseConfig = {
-  apiKey: "AIzaSyBFLQzHxVw5UV1481iRfruD9AEenf_M_lI",
-  authDomain: "realtime-sync-project.firebaseapp.com",
-  databaseURL: "https://realtime-sync-project-default-rtdb.firebaseio.com",
-  projectId: "realtime-sync-project",
-  storageBucket: "realtime-sync-project.appspot.com",
-  messagingSenderId: "1079348282119",
-  appId: "1:1079348282119:web:57d72c95e6212070fe7ba2",
-  measurementId: "G-XKVNBVD6RE"
-};
-
-// Initialize Firebase
-firebase.initializeApp(firebaseConfig);
-const db = firebase.database();
-const auth = firebase.auth();
-const storage = firebase.storage();
-const functions = firebase.functions();
-
-// Import necessary libraries
-import { encrypt, decrypt, generateKeyPair } from 'openpgp';
-import SimplePeer from 'simple-peer';
-
-// User Authentication
-async function signUp(email, password, displayName, phoneNumber) {
-  try {
-    const userCredential = await auth.createUserWithEmailAndPassword(email, password);
-    await userCredential.user.updateProfile({ displayName, phoneNumber });
-    const user = auth.currentUser;
-    const { publicKey, privateKey } = await generateKeyPair({ type: 'ecc', curve: 'curve25519' });
-    await db.ref(`users/${user.uid}`).set({
-      email: user.email,
-      displayName: user.displayName,
-      phoneNumber: user.phoneNumber,
-      publicKey: publicKey.armor()
-    });
-    localStorage.setItem('privateKey', privateKey.armor());
-    updateUserPresence(user.uid);
-    showNotification('Account created successfully!');
-  } catch (error) {
-    handleError(error);
-  }
-}
-
-async function signIn(email, password) {
-  try {
-    await auth.signInWithEmailAndPassword(email, password);
-    const user = auth.currentUser;
-    updateUserPresence(user.uid);
-    showNotification('Signed in successfully!');
-  } catch (error) {
-    handleError(error);
-  }
-}
-
-function signOut() {
-  return auth.signOut()
-    .then(() => showNotification('Signed out successfully!'))
-    .catch(handleError);
-}
-
-// Messaging
-async function sendMessage(senderId, receiverId, message, type = 'text') {
-  try {
-    const chatId = [senderId, receiverId].sort().join('_');
-    const receiverPublicKey = await getPublicKey(receiverId);
-    const encryptedMessage = await encrypt({
-      message: await openpgp.createMessage({ text: message }),
-      publicKeys: await openpgp.readKey({ armoredKey: receiverPublicKey })
-    });
-    await db.ref(`chats/${chatId}`).push({
-      senderId,
-      encryptedMessage: encryptedMessage.armor(),
-      type,
-      timestamp: firebase.database.ServerValue.TIMESTAMP,
-      status: 'sent'
-    });
-    showNotification('Message sent!');
-  } catch (error) {
-    handleError(error);
-  }
-}
-
-async function listenForMessages(chatId, callback) {
-  db.ref(`chats/${chatId}`).on('child_added', async (snapshot) => {
-    try {
-      const message = snapshot.val();
-      const privateKey = await openpgp.readPrivateKey({ armoredKey: localStorage.getItem('privateKey') });
-      const decrypted = await decrypt({
-        message: await openpgp.readMessage({ armoredMessage: message.encryptedMessage }),
-        privateKeys: [privateKey]
-      });
-      callback({ ...message, decryptedMessage: decrypted.data });
-    } catch (error) {
-      handleError(error);
-    }
-  });
-}
-
-// Voice and Video Calls
-function initiateCall(callerId, receiverId, type = 'audio') {
-  const peer = new SimplePeer({ initiator: true, trickle: false });
-  
-  peer.on('signal', data => {
-    db.ref(`calls/${receiverId}`).push({
-      callerId,
-      signal: JSON.stringify(data),
-      type,
-      timestamp: firebase.database.ServerValue.TIMESTAMP
-    });
-  });
-
-  peer.on('stream', stream => {
-    // Display the stream in the UI
-    const video = document.createElement('video');
-    document.body.appendChild(video);
-    video.srcObject = stream;
-    video.play();
-  });
-
-  // Listen for answer
-  db.ref(`calls/${callerId}`).on('child_added', snapshot => {
-    const data = snapshot.val();
-    if (data.receiverId === receiverId) {
-      peer.signal(JSON.parse(data.signal));
-    }
-  });
-}
-
-// Additional Features
-function forwardMessage(messageId, fromChatId, toChatId) {
-  return db.ref(`chats/${fromChatId}/${messageId}`).once('value')
-    .then(snapshot => {
-      const message = snapshot.val();
-      return sendMessage(message.senderId, toChatId, message.message, message.type);
-    })
-    .catch(handleError);
-}
-
-function setCustomNotification(chatId, setting) {
-  const user = auth.currentUser;
-  return db.ref(`userSettings/${user.uid}/notifications/${chatId}`).set(setting)
-    .then(() => showNotification('Notification setting updated!'))
-    .catch(handleError);
-}
-
-// Error Handling
-function handleError(error) {
-  console.error('An error occurred:', error);
-  showNotification(`Error: ${error.message}`, 'error');
-}
-
-function showNotification(message, type = 'info') {
-  // In a real app, use a proper notification library
-  alert(`${type.toUpperCase()}: ${message}`);
-}
-
-// Security Rules (to be set in Firebase Console)
-/*
-{
-  "rules": {
-    "users": {
-      "$uid": {
-        ".read": "$uid === auth.uid",
-        ".write": "$uid === auth.uid"
-      }
-    },
-    "chats": {
-      "$chatId": {
-        ".read": "auth != null && $chatId.contains(auth.uid)",
-        ".write": "auth != null && $chatId.contains(auth.uid)"
-      }
-    },
-    "calls": {
-      "$uid": {
-        ".read": "$uid === auth.uid",
-        ".write": "auth != null"
-      }
-    },
-    "userSettings": {
-      "$uid": {
-        ".read": "$uid === auth.uid",
-        ".write": "$uid === auth.uid"
-      }
-    }
-  }
-}
-*/
-
-// Basic UI Implementation
-function createUI() {
-  const app = document.getElementById('app');
-  app.innerHTML = `
-    <div id="auth">
-      <input id="email" type="email" placeholder="Email">
-      <input id="password" type="password" placeholder="Password">
-      <input id="displayName" type="text" placeholder="Display Name">
-      <input id="phoneNumber" type="tel" placeholder="Phone Number">
-      <button id="signUpBtn">Sign Up</button>
-      <button id="signInBtn">Sign In</button>
-      <button id="signOutBtn">Sign Out</button>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Clone</title>
+    <script src="https://www.gstatic.com/firebasejs/9.6.8/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.8/firebase-auth.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.8/firebase-firestore.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.8/firebase-database.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.6.8/firebase-storage.js"></script>
+</head>
+<body>
+    <div id="login-section">
+        <h2>Login to WhatsApp Clone</h2>
+        <button onclick="loginWithGoogle()">Login with Google</button>
     </div>
-    <div id="chat" style="display:none;">
-      <div id="messages"></div>
-      <input id="messageInput" type="text" placeholder="Type a message">
-      <button id="sendBtn">Send</button>
+
+    <div id="chat-section" style="display: none;">
+        <h2>WhatsApp Clone Chat</h2>
+        <div id="user-info"></div>
+        <button onclick="logout()">Logout</button>
+
+        <div id="chat-window">
+            <ul id="messages"></ul>
+        </div>
+
+        <input type="text" id="message" placeholder="Enter your message...">
+        <button onclick="sendMessage()">Send</button>
+        <br><br>
+
+        <input type="file" id="media" accept="image/*,video/*">
+        <button onclick="sendMedia()">Send Media</button>
     </div>
-  `;
 
-  document.getElementById('signUpBtn').addEventListener('click', () => {
-    const email = document.getElementById('email').value;
-    const password = document.getElementById('password').value;
-    const displayName = document.getElementById('displayName').value;
-    const phoneNumber = document.getElementById('phoneNumber').value;
-    signUp(email, password, displayName, phoneNumber);
-  });
+    <script>
+        // Firebase Configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyBFLQzHxVw5UV1481iRfruD9AEenf_M_lI",
+            authDomain: "realtime-sync-project.firebaseapp.com",
+            databaseURL: "https://realtime-sync-project-default-rtdb.firebaseio.com",
+            projectId: "realtime-sync-project",
+            storageBucket: "realtime-sync-project.appspot.com",
+            messagingSenderId: "1079348282119",
+            appId: "1:1079348282119:web:57d72c95e6212070fe7ba2",
+            measurementId: "G-XKVNBVD6RE"
+        };
 
-  document.getElementById('signInBtn').addEventListener('click', () => {
-    const email = document.getElementById('email').value;
-    const password = document.getElementById('password').value;
-    signIn(email, password);
-  });
+        // Initialize Firebase
+        const app = firebase.initializeApp(firebaseConfig);
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const storage = firebase.storage();
 
-  document.getElementById('signOutBtn').addEventListener('click', signOut);
+        // Login with Google
+        function loginWithGoogle() {
+            const provider = new firebase.auth.GoogleAuthProvider();
+            auth.signInWithPopup(provider).then(result => {
+                document.getElementById('login-section').style.display = 'none';
+                document.getElementById('chat-section').style.display = 'block';
+                document.getElementById('user-info').innerText = `Logged in as: ${result.user.displayName}`;
+                loadMessages();
+            }).catch(console.error);
+        }
 
-  document.getElementById('sendBtn').addEventListener('click', () => {
-    const message = document.getElementById('messageInput').value;
-    const user = auth.currentUser;
-    if (user) {
-      sendMessage(user.uid, 'someReceiverId', message);
-      document.getElementById('messageInput').value = '';
-    }
-  });
-}
+        // Logout
+        function logout() {
+            auth.signOut().then(() => {
+                document.getElementById('login-section').style.display = 'block';
+                document.getElementById('chat-section').style.display = 'none';
+            }).catch(console.error);
+        }
 
-// Initialize the app
-function init() {
-  createUI();
-  auth.onAuthStateChanged(user => {
-    if (user) {
-      console.log('User is signed in', user);
-      document.getElementById('auth').style.display = 'none';
-      document.getElementById('chat').style.display = 'block';
-      updateUserPresence(user.uid);
-      listenForMessages(`${user.uid}_someReceiverId`, message => {
-        const messagesDiv = document.getElementById('messages');
-        messagesDiv.innerHTML += `<p>${message.senderId}: ${message.decryptedMessage}</p>`;
-      });
-    } else {
-      console.log('No user is signed in');
-      document.getElementById('auth').style.display = 'block';
-      document.getElementById('chat').style.display = 'none';
-    }
-  });
-}
+        // Send a Message
+        function sendMessage() {
+            const message = document.getElementById('message').value;
+            db.collection('messages').add({
+                user: auth.currentUser.displayName,
+                message: message,
+                timestamp: firebase.firestore.FieldValue.serverTimestamp()
+            }).then(() => {
+                document.getElementById('message').value = '';
+            });
+        }
 
-init();
+        // Send Media (Images/Videos)
+        function sendMedia() {
+            const file = document.getElementById('media').files[0];
+            if (file) {
+                const storageRef = storage.ref(`media/${file.name}`);
+                storageRef.put(file).then(snapshot => {
+                    storageRef.getDownloadURL().then(url => {
+                        db.collection('messages').add({
+                            user: auth.currentUser.displayName,
+                            media: url,
+                            timestamp: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                    });
+                });
+            }
+        }
+
+        // Load Messages
+        function loadMessages() {
+            db.collection('messages').orderBy('timestamp').onSnapshot(snapshot => {
+                const messagesList = document.getElementById('messages');
+                messagesList.innerHTML = '';
+                snapshot.forEach(doc => {
+                    const messageData = doc.data();
+                    const li = document.createElement('li');
+                    if (messageData.message) {
+                        li.innerText = `${messageData.user}: ${messageData.message}`;
+                    } else if (messageData.media) {
+                        li.innerHTML = `${messageData.user}: <a href="${messageData.media}" target="_blank">Media File</a>`;
+                    }
+                    messagesList.appendChild(li);
+                });
+            });
+        }
+
+        // Real-time listener for authentication state
+        auth.onAuthStateChanged(user => {
+            if (user) {
+                document.getElementById('login-section').style.display = 'none';
+                document.getElementById('chat-section').style.display = 'block';
+                loadMessages();
+            } else {
+                document.getElementById('login-section').style.display = 'block';
+                document.getElementById('chat-section').style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>
